@@ -5,16 +5,19 @@ import socket
 import time
 import httpx
 import logging
-from fastapi import FastAPI, Request, HTTPException, WebSocket, WebSocketDisconnect
+from datetime import datetime
+from fastapi import FastAPI, Request, HTTPException, WebSocket, WebSocketDisconnect, APIRouter
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 import uvicorn
-from datetime import datetime
 
+# ── راه‌اندازی لاگر ──────────────────────────────────────────────────────────
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("X4G")
 
+# ── برنامه FastAPI ──────────────────────────────────────────────────────────
 app = FastAPI(title="X4G Lite", docs_url=None, redoc_url=None)
 
+# ── متغیرهای محیطی ──────────────────────────────────────────────────────────
 PORT = int(os.environ.get("PORT", 8000))
 UUID = os.environ.get("VLESS_UUID") or secrets.token_urlsafe(16)
 
@@ -23,18 +26,20 @@ def get_host() -> str:
 
 HOST = get_host()
 
+# ── آمار و اتصالات ──────────────────────────────────────────────────────────
 stats = {"total_bytes": 0, "total_requests": 0, "start_time": time.time()}
 connections = {}
 http_client = None
 
+# ── ربات تلگرام ─────────────────────────────────────────────────────────────
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
 ADMIN_IDS = {int(x) for x in os.environ.get("TELEGRAM_ADMIN_IDS", "").replace(" ", "").split(",") if x.isdigit()}
 _api_client = None
 _bot_running = False
 _poll_task = None
 
-# ── متغیرهای مورد نیاز برای xhttp_siz10 ──────────────────────────────────────
-LINKS = {}                 # dummy
+# ── متغیرهای مورد نیاز برای XHTTP ──────────────────────────────────────────
+LINKS = {}                 # استاب (در این دمو خالی)
 LINKS_LOCK = asyncio.Lock()
 hourly_traffic = {}
 error_logs = []
@@ -52,17 +57,10 @@ async def save_state():
 async def throttle(uuid, nbytes):
     pass
 
-# check_and_use: همیشه True برمی‌گرداند (برای اجرای آزمایشی)
 async def check_and_use(uuid, nbytes):
     return True
 
-# ── تعریف توابع مورد نیاز main (parse_vless_header قبلاً وجود دارد) ──────────
-# parse_vless_header از main اصلی گرفته می‌شود (همان کد موجود)
-# اما چون در xhttp_siz10 از آن استفاده شده، باید در دسترس باشد.
-# ما آن را دوباره تعریف نمی‌کنیم (قبلاً در main وجود دارد).
-# اما از آنجایی که main فعلی parse_vless_header دارد، خوب است.
-
-# ── تعریف xhttp_router (محتوای xhttp_siz10.py) ──────────────────────────────
+# ── توابع کمکی برای XHTTP ──────────────────────────────────────────────────
 XHTTP_BUF = 512 * 1024
 DOWNLINK_QUEUE_MAX = 512
 SESSION_IDLE_TIMEOUT = 30
@@ -324,7 +322,7 @@ def _downstream_gen(sess: dict):
             pass
     return gen()
 
-# ── ساخت روتر ──────────────────────────────────────────────────────────────────
+# ── تعریف روتر XHTTP ──────────────────────────────────────────────────────
 router = APIRouter()
 
 @router.get("/xhttp-siz10/{mode}/{uuid}/{session_id}")
@@ -431,11 +429,10 @@ async def stream_up_upload(uuid: str, session_id: str, request: Request):
     await gate.flush()
     return {"ok": True}
 
-# ── اتصال روتر به برنامه ─────────────────────────────────────────────────────
+# ── اتصال روتر به برنامه ──────────────────────────────────────────────────
 app.include_router(router)
 
-# ── ادامه کد اصلی main ──────────────────────────────────────────────────────
-
+# ── رویدادهای startup/shutdown ──────────────────────────────────────────
 @app.on_event("startup")
 async def startup():
     global http_client, _api_client, _bot_running, _poll_task, HOST
@@ -467,6 +464,7 @@ async def shutdown():
     if _api_client:
         await _api_client.aclose()
 
+# ── مسیرهای عمومی ────────────────────────────────────────────────────────
 @app.get("/health")
 async def health():
     return {"status": "ok", "connections": len(connections)}
@@ -498,8 +496,8 @@ async def http_proxy(target_url: str, request: Request):
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"Proxy error: {exc}")
 
+# ── WebSocket ──────────────────────────────────────────────────────────────
 RELAY_BUF = 256 * 1024
-TCP_CONNECT_TIMEOUT = 10.0
 
 def _ws_client_ip(ws: WebSocket) -> str:
     fwd = ws.headers.get("x-forwarded-for")
@@ -656,8 +654,7 @@ async def websocket_tunnel(ws: WebSocket, uuid: str):
         connections.pop(conn_id, None)
         logger.info(f"WS {conn_id} closed")
 
-# ── ربات تلگرام ──────────────────────────────────────────────────────────────
-
+# ── ربات تلگرام ────────────────────────────────────────────────────────────
 async def _call(method, **params):
     if _api_client is None:
         return None
@@ -726,5 +723,6 @@ async def xhttp_link():
     link = f"XHTTP://{UUID}@{HOST}:443?type=xhttp-siz10&mode=stream-up&host={HOST}&fp=chrome#X4G-XHTTP"
     return {"link": link}
 
+# ── اجرای اصلی ─────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     uvicorn.run("main:app", host="0.0.0.0", port=PORT, log_level="info", workers=1)
