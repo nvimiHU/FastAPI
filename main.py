@@ -6,8 +6,8 @@ import time
 import httpx
 import logging
 from datetime import datetime
-from fastapi import FastAPI, Request, HTTPException, WebSocket, WebSocketDisconnect, APIRouter
-from fastapi.responses import JSONResponse, Response, StreamingResponse
+from fastapi import FastAPI, Request, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi.responses import JSONResponse, Response
 import uvicorn
 
 # ── راه‌اندازی لاگر ──────────────────────────────────────────────────────────
@@ -27,7 +27,7 @@ def get_host() -> str:
 HOST = get_host()
 
 # ── آمار و اتصالات ──────────────────────────────────────────────────────────
-stats = {"total_bytes": 0, "total_requests": 0, "start_time": time.time()}
+stats = {"total_bytes": 0, "total_requests": 0, "start_time": time.time(), "total_errors": 0}
 connections = {}
 http_client = None
 
@@ -38,13 +38,13 @@ _api_client = None
 _bot_running = False
 _poll_task = None
 
-# ── متغیرهای مورد نیاز برای XHTTP ──────────────────────────────────────────
-LINKS = {}                 # استاب (در این دمو خالی)
+# ── داده‌های لینک (برای VLESS) ─────────────────────────────────────────────
+LINKS = {}                 # در این دمو خالی است، اما ساختار نگه داشته می‌شود
 LINKS_LOCK = asyncio.Lock()
 hourly_traffic = {}
 error_logs = []
-_reaper_started = False
 
+# ── توابع کمکی برای سیستم لینک ─────────────────────────────────────────────
 def is_link_allowed(link):
     return True
 
@@ -54,383 +54,205 @@ def is_ip_allowed(link, uuid, ip):
 async def save_state():
     pass
 
-async def throttle(uuid, nbytes):
-    pass
+def log_activity(action, message, level="info"):
+    logger.log(getattr(logging, level.upper()), f"{action}: {message}")
 
-async def check_and_use(uuid, nbytes):
-    return True
+def now_ir():
+    return datetime.now()
 
-# ── توابع کمکی برای XHTTP ──────────────────────────────────────────────────
-XHTTP_BUF = 512 * 1024
-DOWNLINK_QUEUE_MAX = 512
-SESSION_IDLE_TIMEOUT = 30
-REAPER_INTERVAL = 10
-TCP_CONNECT_TIMEOUT = 10.0
+# ── توابع مربوط به WebSocket/VLESS (برگرفته از relay_vless.py) ────────────
+RELAY_BUF = 256 * 1024   # 256 KB buffer
 
-SOCK_BUF_SIZE = 2 * 1024 * 1024
-FLOW_MIN_HW = 256 * 1024
-FLOW_MAX_HW = 16 * 1024 * 1024
-FLOW_START_HW = 2 * 1024 * 1024
-FLOW_FAST_DRAIN_MS = 2.0
-FLOW_SLOW_DRAIN_MS = 25.0
-
-QUOTA_MIN_BATCH = 32 * 1024
-QUOTA_MAX_BATCH = 1 * 1024 * 1024
-QUOTA_START_BATCH = 64 * 1024
-QUOTA_CHECK_INTERVAL = 0.2
-
-PACKET_UP_HIGH_WATER = 2 * 1024 * 1024
-
-xhttp_sessions = {}
-XHTTP_LOCK = asyncio.Lock()
-
-FINGERPRINTS = {
-    "chrome": {
-        "content-type": "application/grpc",
-        "cache-control": "no-cache, no-store",
-        "x-accel-buffering": "no",
-        "server": "cloudflare",
-    },
-    "plain": {
-        "content-type": "application/octet-stream",
-        "cache-control": "no-store",
-        "x-accel-buffering": "no",
-    },
-}
-DEFAULT_FINGERPRINT = "chrome"
-
-def _resp_headers(fp: str) -> dict:
-    return dict(FINGERPRINTS.get(fp, FINGERPRINTS[DEFAULT_FINGERPRINT]))
-
-def _tune_socket(writer: asyncio.StreamWriter):
-    sock = writer.transport.get_extra_info("socket")
-    if not sock:
-        return
-    try:
-        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, SOCK_BUF_SIZE)
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, SOCK_BUF_SIZE)
-    except OSError:
-        pass
-
-class _QuotaGate:
-    __slots__ = ("uuid", "pending", "last_check", "ok", "batch_bytes", "rate_ewma")
-    def __init__(self, uuid: str):
-        self.uuid = uuid
-        self.pending = 0
-        self.last_check = time.monotonic()
-        self.ok = True
-        self.batch_bytes = QUOTA_START_BATCH
-        self.rate_ewma = 0.0
-
-    async def add(self, nbytes: int) -> bool:
-        if not self.ok:
-            return False
-        self.pending += nbytes
-        now = time.monotonic()
-        elapsed = now - self.last_check
-        if self.pending >= self.batch_bytes or elapsed >= QUOTA_CHECK_INTERVAL:
-            flush, self.pending = self.pending, 0
-            if elapsed > 0:
-                inst_rate = flush / elapsed
-                self.rate_ewma = inst_rate if self.rate_ewma == 0 else (0.7 * self.rate_ewma + 0.3 * inst_rate)
-                target = int(self.rate_ewma * QUOTA_CHECK_INTERVAL)
-                self.batch_bytes = max(QUOTA_MIN_BATCH, min(QUOTA_MAX_BATCH, target or QUOTA_MIN_BATCH))
-            self.last_check = now
-            self.ok = await check_and_use(self.uuid, flush)
-            return self.ok
-        return True
-
-    async def flush(self) -> bool:
-        if self.pending:
-            flush, self.pending = self.pending, 0
-            self.ok = self.ok and await check_and_use(self.uuid, flush)
-        return self.ok
-
-class _AdaptiveFlow:
-    __slots__ = ("high_water", "last_drain_ms")
-    def __init__(self):
-        self.high_water = FLOW_START_HW
-        self.last_drain_ms = 0.0
-
-    def should_drain(self, buf_size: int) -> bool:
-        return buf_size > self.high_water
-
-    async def drain(self, writer: asyncio.StreamWriter):
-        t0 = time.monotonic()
-        await writer.drain()
-        elapsed_ms = (time.monotonic() - t0) * 1000
-        self.last_drain_ms = elapsed_ms
-        if elapsed_ms < FLOW_FAST_DRAIN_MS:
-            self.high_water = min(FLOW_MAX_HW, int(self.high_water * 1.5) + 65536)
-        elif elapsed_ms > FLOW_SLOW_DRAIN_MS:
-            self.high_water = max(FLOW_MIN_HW, self.high_water // 2)
-
-def _req_client_ip(request: Request) -> str:
-    fwd = request.headers.get("x-forwarded-for")
+def _ws_client_ip(ws: WebSocket) -> str:
+    fwd = ws.headers.get("x-forwarded-for")
     if fwd:
         return fwd.split(",")[0].strip()
-    real_ip = request.headers.get("x-real-ip")
+    real_ip = ws.headers.get("x-real-ip")
     if real_ip:
         return real_ip.strip()
-    return request.client.host if request.client else "نامشخص"
+    return ws.client.host if ws.client else "نامشخص"
 
-async def _open_tcp_from_header(first_chunk: bytes):
-    command, address, port, payload = await parse_vless_header(first_chunk)
-    reader, writer = await asyncio.wait_for(
-        asyncio.open_connection(address, port), timeout=TCP_CONNECT_TIMEOUT
-    )
-    _tune_socket(writer)
-    if payload:
-        writer.write(payload)
-        await writer.drain()
-    return reader, writer, address, port
+async def parse_vless_header(chunk: bytes):
+    if len(chunk) < 24:
+        raise ValueError("chunk too small")
+    pos = 1
+    pos += 16
+    addon_len = chunk[pos]
+    pos += 1 + addon_len
+    command = chunk[pos]
+    pos += 1
+    port = int.from_bytes(chunk[pos:pos+2], "big")
+    pos += 2
+    addr_type = chunk[pos]
+    pos += 1
+    if addr_type == 1:
+        address = ".".join(str(b) for b in chunk[pos:pos+4])
+        pos += 4
+    elif addr_type == 2:
+        dlen = chunk[pos]
+        pos += 1
+        address = chunk[pos:pos+dlen].decode("utf-8", errors="ignore")
+        pos += dlen
+    elif addr_type == 3:
+        ab = chunk[pos:pos+16]
+        pos += 16
+        address = ":".join(f"{ab[i]:02x}{ab[i+1]:02x}" for i in range(0, 16, 2))
+    else:
+        raise ValueError(f"unknown addr type: {addr_type}")
+    return command, address, port, chunk[pos:]
 
-async def _check_link(uuid: str):
+async def check_and_use(uid: str, n: int) -> bool:
     async with LINKS_LOCK:
-        link = LINKS.get(uuid)
-    if not is_link_allowed(link):
-        raise HTTPException(status_code=403, detail="not authorized")
+        link = LINKS.get(uid)
+        if link is None:
+            return False
+        if not is_link_allowed(link):
+            return False
+        # در این دمو، فقط مقداردهی ساده
+        stats["total_bytes"] += n
+        hourly_traffic[now_ir().strftime("%H:00")] = hourly_traffic.get(now_ir().strftime("%H:00"), 0) + n
+    return True
 
-async def _get_or_create_session(uuid: str, mode: str, session_id: str, ip: str = "نامشخص") -> dict:
-    async with XHTTP_LOCK:
-        sess = xhttp_sessions.get(session_id)
-        if sess is not None:
-            sess["last_seen"] = time.time()
-            return sess
-
-        async with LINKS_LOCK:
-            link = LINKS.get(uuid)
-        if not is_ip_allowed(link, uuid, ip):
-            logger.warning(f"🚫 XHTTP[{mode}] rejected uuid={uuid[:8]} ip={ip} (ip limit reached)")
-            raise HTTPException(status_code=403, detail="ip limit reached")
-
-        conn_id = secrets.token_urlsafe(6)
-        connections[conn_id] = {
-            "uuid": uuid,
-            "ip": ip,
-            "connected_at": datetime.now().isoformat(),
-            "bytes": 0,
-            "transport": f"xhttp-{mode}",
-        }
-        sess = {
-            "uuid": uuid, "mode": mode, "writer": None,
-            "downlink_task": None, "uplink_task": None,
-            "down_q": asyncio.Queue(maxsize=DOWNLINK_QUEUE_MAX),
-            "last_seen": time.time(),
-            "conn_id": conn_id, "tcp_open": False, "closed": False,
-            "seq_buf": {}, "next_seq": 0,
-            "gate": None,
-            "flow": None,
-        }
-        xhttp_sessions[session_id] = sess
-        logger.info(f"new XHTTP[{mode}] session [{session_id[:8]}] uuid={uuid[:8]} ip={ip}")
-        return sess
-
-async def _teardown(session_id: str):
-    async with XHTTP_LOCK:
-        sess = xhttp_sessions.pop(session_id, None)
-    if not sess:
-        return
-    sess["closed"] = True
-    for t in ("uplink_task", "downlink_task"):
-        task = sess.get(t)
-        if task:
-            task.cancel()
-            try:
-                await task
-            except (asyncio.CancelledError, Exception):
-                pass
-    writer = sess.get("writer")
-    if writer:
-        try:
-            writer.close()
-            await writer.wait_closed()
-        except Exception:
-            pass
-    connections.pop(sess.get("conn_id"), None)
-    dq = sess.get("down_q")
-    if dq:
-        try:
-            dq.put_nowait(None)
-        except Exception:
-            pass
-    logger.info(f"closed XHTTP[{sess.get('mode')}] [{session_id[:8]}] total={len(xhttp_sessions)}")
-
-async def _reaper():
-    while True:
-        await asyncio.sleep(REAPER_INTERVAL)
-        now = time.time()
-        async with XHTTP_LOCK:
-            stale = [sid for sid, s in xhttp_sessions.items()
-                     if now - s["last_seen"] > SESSION_IDLE_TIMEOUT and not s.get("tcp_open")]
-        for sid in stale:
-            await _teardown(sid)
-
-def ensure_reaper():
-    global _reaper_started
-    if not _reaper_started:
-        asyncio.create_task(_reaper())
-        _reaper_started = True
-
-async def _pump_tcp_to_queue(session_id: str, uuid: str, reader: asyncio.StreamReader, down_q: asyncio.Queue):
-    first = True
-    gate = _QuotaGate(uuid)
+async def relay_ws_to_tcp(ws: WebSocket, writer: asyncio.StreamWriter, conn_id: str, uid: str):
     try:
         while True:
-            data = await reader.read(XHTTP_BUF)
+            msg = await ws.receive()
+            if msg["type"] == "websocket.disconnect":
+                break
+            data = msg.get("bytes") or (msg.get("text") or "").encode()
             if not data:
+                continue
+            if not await check_and_use(uid, len(data)):
+                await ws.close(code=1008, reason="quota/disabled/unknown")
                 break
-            if not await gate.add(len(data)):
-                break
-            await throttle(uuid, len(data))
-            async with XHTTP_LOCK:
-                sess = xhttp_sessions.get(session_id)
-            if sess:
-                c = connections.get(sess["conn_id"])
-                if c:
-                    c["bytes"] += len(data)
-            payload = (b"\x00\x00" + data) if first else data
-            first = False
-            await down_q.put(payload)
-    except (asyncio.CancelledError, Exception):
+            stats["total_requests"] += 1
+            if conn_id in connections:
+                connections[conn_id]["bytes"] += len(data)
+            writer.write(data)
+            if writer.transport.get_write_buffer_size() > RELAY_BUF:
+                await writer.drain()
+    except (WebSocketDisconnect, Exception):
         pass
     finally:
-        await gate.flush()
-        await _teardown(session_id)
-
-async def _open_tcp_for_session(session_id: str, uuid: str, sess: dict, first_chunk: bytes):
-    reader, writer, address, port = await _open_tcp_from_header(first_chunk)
-    logger.info(f"connect XHTTP[{sess['mode']}] [{session_id[:8]}] -> {address}:{port}")
-    sess["writer"] = writer
-    sess["tcp_open"] = True
-    sess["downlink_task"] = asyncio.create_task(
-        _pump_tcp_to_queue(session_id, uuid, reader, sess["down_q"])
-    )
-    asyncio.create_task(save_state())
-
-def _downstream_gen(sess: dict):
-    async def gen():
         try:
-            while True:
-                chunk = await sess["down_q"].get()
-                if chunk is None:
-                    break
-                sess["last_seen"] = time.time()
-                yield chunk
-        finally:
+            writer.write_eof()
+        except Exception:
             pass
-    return gen()
 
-# ── تعریف روتر XHTTP ──────────────────────────────────────────────────────
-router = APIRouter()
-
-@router.get("/xhttp-siz10/{mode}/{uuid}/{session_id}")
-async def xhttp_downlink(mode: str, uuid: str, session_id: str, request: Request):
-    ensure_reaper()
-    if mode not in ("packet-up", "stream-up"):
-        raise HTTPException(status_code=404, detail="unknown mode")
-    await _check_link(uuid)
-    fp = request.query_params.get("fp", DEFAULT_FINGERPRINT)
-    sess = await _get_or_create_session(uuid, mode, session_id, _req_client_ip(request))
-    if sess.get("closed"):
-        raise HTTPException(status_code=404, detail="session closed")
-    headers = _resp_headers(fp)
-    return StreamingResponse(_downstream_gen(sess), headers=headers, media_type=headers["content-type"])
-
-@router.post("/xhttp-siz10/packet-up/{uuid}/{session_id}/{seq}")
-async def packet_up_upload(uuid: str, session_id: str, seq: int, request: Request):
-    ensure_reaper()
-    sess = await _get_or_create_session(uuid, "packet-up", session_id, _req_client_ip(request))
-    if sess.get("closed"):
-        raise HTTPException(status_code=404, detail="session closed")
-    sess["last_seen"] = time.time()
-    body = await request.body()
-    if not body:
-        return {"ok": True}
-    if not await check_and_use(uuid, len(body)):
-        await _teardown(session_id)
-        raise HTTPException(status_code=403, detail="quota/disabled/unknown")
-    await throttle(uuid, len(body))
-    stats["total_requests"] += 1
-    connections[sess["conn_id"]]["bytes"] += len(body)
+async def relay_tcp_to_ws(ws: WebSocket, reader: asyncio.StreamReader, conn_id: str, uid: str):
+    first = True
     try:
-        if sess["writer"] is None:
-            if seq != 0:
-                sess["seq_buf"][seq] = body
-                return {"ok": True, "buffered": True}
-            await _open_tcp_for_session(session_id, uuid, sess, body)
-            nxt = 1
-            while nxt in sess["seq_buf"]:
-                pending = sess["seq_buf"].pop(nxt)
-                sess["writer"].write(pending)
-                nxt += 1
-            sess["next_seq"] = nxt
-            return {"ok": True, "connected": True}
-        if seq == sess["next_seq"]:
-            sess["writer"].write(body)
-            sess["next_seq"] += 1
-            while sess["next_seq"] in sess["seq_buf"]:
-                pending = sess["seq_buf"].pop(sess["next_seq"])
-                sess["writer"].write(pending)
-                sess["next_seq"] += 1
-        else:
-            sess["seq_buf"][seq] = body
-        if sess["writer"].transport.get_write_buffer_size() > PACKET_UP_HIGH_WATER:
-            await sess["writer"].drain()
-    except Exception as exc:
-        error_logs.append({"error": str(exc), "time": datetime.now().isoformat()})
-        await _teardown(session_id)
-        raise HTTPException(status_code=502, detail="write failed")
-    return {"ok": True}
+        while True:
+            data = await reader.read(RELAY_BUF)
+            if not data:
+                break
+            if not await check_and_use(uid, len(data)):
+                await ws.close(code=1008, reason="quota/disabled/unknown")
+                break
+            if conn_id in connections:
+                connections[conn_id]["bytes"] += len(data)
+            payload = (b"\x00\x00" + data) if first else data
+            first = False
+            await ws.send_bytes(payload)
+    except Exception:
+        pass
 
-@router.post("/xhttp-siz10/stream-up/{uuid}/{session_id}")
-async def stream_up_upload(uuid: str, session_id: str, request: Request):
-    ensure_reaper()
-    sess = await _get_or_create_session(uuid, "stream-up", session_id, _req_client_ip(request))
-    if sess.get("closed"):
-        raise HTTPException(status_code=404, detail="session closed")
-    gate = sess.get("gate")
-    if gate is None:
-        gate = _QuotaGate(uuid)
-        sess["gate"] = gate
-    flow = sess.get("flow")
-    if flow is None:
-        flow = _AdaptiveFlow()
-        sess["flow"] = flow
-    conn = connections[sess["conn_id"]]
-    writer = sess["writer"]
+async def websocket_tunnel(ws: WebSocket, uuid: str):
+    await ws.accept()
+
+    async with LINKS_LOCK:
+        link = LINKS.get(uuid)
+
+    if not is_link_allowed(link):
+        logger.warning(f"🚫 WS rejected uuid={uuid[:8]}… (not allowed)")
+        await ws.close(code=1008, reason="not authorized")
+        return
+
+    ip = _ws_client_ip(ws)
+
+    if not is_ip_allowed(link, uuid, ip):
+        logger.warning(f"🚫 WS rejected uuid={uuid[:8]}… ip={ip} (ip limit reached)")
+        log_activity("connection", f"اتصال {ip} به کانفیگ رد شد (محدودیت تعداد آی‌پی)", "warn")
+        await ws.close(code=1008, reason="ip limit reached")
+        return
+
+    conn_id = secrets.token_urlsafe(6)
+    connections[conn_id] = {
+        "uuid": uuid,
+        "ip": ip,
+        "transport": "vless-ws",
+        "connected_at": datetime.now().isoformat(),
+        "bytes": 0,
+    }
+    logger.info(f"✅ WS [{conn_id}] uuid={uuid[:8]}… ip={ip} total={len(connections)}")
+    log_activity("connection", f"اتصال جدید از {ip}", "info")
+    writer = None
+
     try:
-        async for chunk in request.stream():
-            if not chunk:
-                continue
-            sess["last_seen"] = time.time()
-            if not await gate.add(len(chunk)):
-                raise HTTPException(status_code=403, detail="quota/disabled/unknown")
-            await throttle(uuid, len(chunk))
-            stats["total_requests"] += 1
-            conn["bytes"] += len(chunk)
-            if writer is None:
-                await _open_tcp_for_session(session_id, uuid, sess, chunk)
-                writer = sess["writer"]
-                continue
-            writer.write(chunk)
-            if flow.should_drain(writer.transport.get_write_buffer_size()):
-                await flow.drain(writer)
-    except HTTPException:
-        await gate.flush()
-        await _teardown(session_id)
-        raise
-    except Exception as exc:
-        error_logs.append({"error": str(exc), "time": datetime.now().isoformat()})
-        await gate.flush()
-        await _teardown(session_id)
-        raise HTTPException(status_code=502, detail="stream error")
-    await gate.flush()
-    return {"ok": True}
+        first_msg = await asyncio.wait_for(ws.receive(), timeout=15.0)
+        if first_msg["type"] == "websocket.disconnect":
+            return
+        first_chunk = first_msg.get("bytes") or (first_msg.get("text") or "").encode()
+        if not first_chunk:
+            return
 
-# ── اتصال روتر به برنامه ──────────────────────────────────────────────────
-app.include_router(router)
+        command, address, port, payload = await parse_vless_header(first_chunk)
+
+        if not await check_and_use(uuid, len(first_chunk)):
+            await ws.close(code=1008, reason="quota/disabled")
+            return
+
+        stats["total_requests"] += 1
+        if conn_id in connections:
+            connections[conn_id]["bytes"] += len(first_chunk)
+        logger.info(f"➡️  [{conn_id}] → {address}:{port}")
+
+        reader, writer = await asyncio.wait_for(
+            asyncio.open_connection(address, port),
+            timeout=10.0
+        )
+        sock = writer.transport.get_extra_info('socket')
+        if sock:
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+
+        if payload:
+            writer.write(payload)
+            await writer.drain()
+
+        done, pending = await asyncio.wait(
+            {
+                asyncio.create_task(relay_ws_to_tcp(ws, writer, conn_id, uuid)),
+                asyncio.create_task(relay_tcp_to_ws(ws, reader, conn_id, uuid)),
+            },
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        for t in pending:
+            t.cancel()
+            try:
+                await t
+            except asyncio.CancelledError:
+                pass
+
+        asyncio.create_task(save_state())
+
+    except WebSocketDisconnect:
+        pass
+    except asyncio.TimeoutError:
+        stats["total_errors"] += 1
+        error_logs.append({"error": "connection timeout", "time": datetime.now().isoformat()})
+    except Exception as exc:
+        stats["total_errors"] += 1
+        error_logs.append({"error": str(exc), "time": datetime.now().isoformat()})
+        logger.error(f"WS error [{conn_id}]: {exc}")
+    finally:
+        if writer:
+            try:
+                writer.close()
+                await writer.wait_closed()
+            except Exception:
+                pass
+        connections.pop(conn_id, None)
+        logger.info(f"🔌 WS closed [{conn_id}] total={len(connections)}")
 
 # ── رویدادهای startup/shutdown ──────────────────────────────────────────
 @app.on_event("startup")
@@ -475,7 +297,8 @@ async def get_stats():
         "total_bytes": stats["total_bytes"],
         "total_requests": stats["total_requests"],
         "connections": len(connections),
-        "uptime_sec": int(time.time() - stats["start_time"])
+        "uptime_sec": int(time.time() - stats["start_time"]),
+        "total_errors": stats.get("total_errors", 0)
     }
 
 _HOP = {"connection","keep-alive","proxy-authenticate","proxy-authorization",
@@ -497,162 +320,9 @@ async def http_proxy(target_url: str, request: Request):
         raise HTTPException(status_code=502, detail=f"Proxy error: {exc}")
 
 # ── WebSocket ──────────────────────────────────────────────────────────────
-RELAY_BUF = 256 * 1024
-
-def _ws_client_ip(ws: WebSocket) -> str:
-    fwd = ws.headers.get("x-forwarded-for")
-    if fwd:
-        return fwd.split(",")[0].strip()
-    real_ip = ws.headers.get("x-real-ip")
-    if real_ip:
-        return real_ip.strip()
-    return ws.client.host if ws.client else "نامشخص"
-
-def _tune_socket_ws(writer):
-    sock = writer.transport.get_extra_info("socket")
-    if not sock:
-        return
-    try:
-        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 2 * 1024 * 1024)
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 2 * 1024 * 1024)
-    except OSError:
-        pass
-
-async def parse_vless_header(chunk: bytes):
-    if len(chunk) < 24:
-        raise ValueError("chunk too small")
-    pos = 1
-    pos += 16
-    addon_len = chunk[pos]
-    pos += 1 + addon_len
-    command = chunk[pos]
-    pos += 1
-    port = int.from_bytes(chunk[pos:pos+2], "big")
-    pos += 2
-    addr_type = chunk[pos]
-    pos += 1
-    if addr_type == 1:
-        address = ".".join(str(b) for b in chunk[pos:pos+4])
-        pos += 4
-    elif addr_type == 2:
-        dlen = chunk[pos]
-        pos += 1
-        address = chunk[pos:pos+dlen].decode("utf-8", errors="ignore")
-        pos += dlen
-    elif addr_type == 3:
-        ab = chunk[pos:pos+16]
-        pos += 16
-        address = ":".join(f"{ab[i]:02x}{ab[i+1]:02x}" for i in range(0, 16, 2))
-    else:
-        raise ValueError(f"unknown addr type: {addr_type}")
-    return command, address, port, chunk[pos:]
-
-async def relay_ws_to_tcp(ws, writer, conn_id):
-    try:
-        while True:
-            msg = await ws.receive()
-            if msg["type"] == "websocket.disconnect":
-                break
-            data = msg.get("bytes") or (msg.get("text") or "").encode()
-            if not data:
-                continue
-            stats["total_requests"] += 1
-            stats["total_bytes"] += len(data)
-            if conn_id in connections:
-                connections[conn_id]["bytes"] += len(data)
-            writer.write(data)
-            if writer.transport.get_write_buffer_size() > RELAY_BUF:
-                await writer.drain()
-    except Exception:
-        pass
-    finally:
-        try:
-            writer.write_eof()
-        except Exception:
-            pass
-
-async def relay_tcp_to_ws(ws, reader, conn_id):
-    first = True
-    try:
-        while True:
-            data = await reader.read(RELAY_BUF)
-            if not data:
-                break
-            stats["total_requests"] += 1
-            stats["total_bytes"] += len(data)
-            if conn_id in connections:
-                connections[conn_id]["bytes"] += len(data)
-            payload = (b"\x00\x00" + data) if first else data
-            first = False
-            await ws.send_bytes(payload)
-    except Exception:
-        pass
-
 @app.websocket("/ws/{uuid}")
-async def websocket_tunnel(ws: WebSocket, uuid: str):
-    if uuid != UUID:
-        await ws.close(code=1008, reason="invalid uuid")
-        return
-    await ws.accept()
-    ip = _ws_client_ip(ws)
-    conn_id = secrets.token_urlsafe(6)
-    connections[conn_id] = {
-        "ip": ip,
-        "uuid": uuid,
-        "connected_at": time.time(),
-        "bytes": 0
-    }
-    logger.info(f"WS connected {conn_id} from {ip}")
-    writer = None
-    try:
-        first_msg = await asyncio.wait_for(ws.receive(), timeout=15.0)
-        if first_msg["type"] == "websocket.disconnect":
-            return
-        first_chunk = first_msg.get("bytes") or (first_msg.get("text") or "").encode()
-        if not first_chunk:
-            return
-        command, address, port, payload = await parse_vless_header(first_chunk)
-        stats["total_requests"] += 1
-        stats["total_bytes"] += len(first_chunk)
-        connections[conn_id]["bytes"] += len(first_chunk)
-        logger.info(f"WS {conn_id} -> {address}:{port}")
-        reader, writer = await asyncio.wait_for(
-            asyncio.open_connection(address, port),
-            timeout=TCP_CONNECT_TIMEOUT
-        )
-        _tune_socket_ws(writer)
-        if payload:
-            writer.write(payload)
-            await writer.drain()
-        done, pending = await asyncio.wait(
-            {
-                asyncio.create_task(relay_ws_to_tcp(ws, writer, conn_id)),
-                asyncio.create_task(relay_tcp_to_ws(ws, reader, conn_id))
-            },
-            return_when=asyncio.FIRST_COMPLETED
-        )
-        for t in pending:
-            t.cancel()
-            try:
-                await t
-            except asyncio.CancelledError:
-                pass
-    except WebSocketDisconnect:
-        pass
-    except asyncio.TimeoutError:
-        logger.warning(f"WS {conn_id} timeout")
-    except Exception as exc:
-        logger.error(f"WS {conn_id} error: {exc}")
-    finally:
-        if writer:
-            try:
-                writer.close()
-                await writer.wait_closed()
-            except Exception:
-                pass
-        connections.pop(conn_id, None)
-        logger.info(f"WS {conn_id} closed")
+async def websocket_endpoint(ws: WebSocket, uuid: str):
+    await websocket_tunnel(ws, uuid)
 
 # ── ربات تلگرام ────────────────────────────────────────────────────────────
 async def _call(method, **params):
@@ -684,7 +354,7 @@ async def _handle_message(msg):
     elif text == "/config":
         current_host = get_host()
         current_uuid = UUID
-        link = f"vless://{current_uuid}@{current_host}:443?encryption=none&security=tls&type=xhttp&host={current_host}&path=/xhttp-siz10/{current_uuid}&mode=auto&sni={current_host}&fp=chrome&alpn=h2%2Chttp%2F1.1#X4G-Mahdi"
+        link = f"vless://{current_uuid}@{current_host}:443?encryption=none&security=tls&type=ws&host={current_host}&path=/ws/{current_uuid}&sni={current_host}&fp=chrome&alpn=h2%2Chttp%2F1.1#X4G-Mahdi"
         await _send(chat_id, f"🔗 لینک اتصال:\n<code>{link}</code>")
     elif text == "/stats":
         try:
@@ -720,9 +390,9 @@ async def _poll_loop():
             logger.warning(f"Poll loop error: {e}")
             await asyncio.sleep(3)
 
-@app.get("/xhttp")
+@app.get("/xhttp")  # این مسیر فقط برای نمایش لینک XHTTP (اختیاری) باقی می‌ماند، اما می‌توان حذف کرد.
 async def xhttp_link():
-    link = f"XHTTP://{UUID}@{HOST}:443?type=xhttp-siz10&mode=stream-up&host={HOST}&fp=chrome#X4G-XHTTP"
+    link = f"vless://{UUID}@{HOST}:443?encryption=none&security=tls&type=ws&host={HOST}&path=/ws/{UUID}&sni={HOST}&fp=chrome#X4G-WS"
     return {"link": link}
 
 # ── اجرای اصلی ─────────────────────────────────────────────────────────────
