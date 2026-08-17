@@ -4,7 +4,7 @@ import secrets
 import time
 import httpx
 import logging
-from fastapi import FastAPI, Request, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Request, HTTPException, WebSocket
 from fastapi.responses import JSONResponse, Response
 import uvicorn
 
@@ -13,10 +13,13 @@ logger = logging.getLogger("X4G")
 
 app = FastAPI(title="X4G Lite", docs_url=None, redoc_url=None)
 
-UUID = os.environ.get("VLESS_UUID") or secrets.token_urlsafe(16)
-PROTOCOLS = [p.strip() for p in os.environ.get("PROTOCOLS", "vless-ws,xhttp-packet-up").split(",") if p.strip()]
 PORT = int(os.environ.get("PORT", 8000))
-HOST = os.environ.get("RAILWAY_PUBLIC_DOMAIN", "localhost")
+UUID = os.environ.get("VLESS_UUID") or secrets.token_urlsafe(16)
+
+def get_host() -> str:
+    return os.environ.get("RAILWAY_PUBLIC_DOMAIN") or os.environ.get("RAILWAY_STATIC_URL") or "localhost"
+
+HOST = get_host()
 
 stats = {"total_bytes": 0, "total_requests": 0, "start_time": time.time()}
 connections = {}
@@ -30,14 +33,19 @@ _poll_task = None
 
 @app.on_event("startup")
 async def startup():
-    global http_client, _api_client, _bot_running, _poll_task
+    global http_client, _api_client, _bot_running, _poll_task, HOST
+    HOST = get_host()
+    if not BOT_TOKEN:
+        logger.error("TELEGRAM_BOT_TOKEN is required but not set. Exiting.")
+        raise RuntimeError("TELEGRAM_BOT_TOKEN not set")
+    if not ADMIN_IDS:
+        logger.error("TELEGRAM_ADMIN_IDS is required but not set. Exiting.")
+        raise RuntimeError("TELEGRAM_ADMIN_IDS not set")
     http_client = httpx.AsyncClient(limits=httpx.Limits(max_connections=500), timeout=30.0)
     _api_client = httpx.AsyncClient(timeout=40.0)
-    if BOT_TOKEN and ADMIN_IDS:
-        _bot_running = True
-        _poll_task = asyncio.create_task(_poll_loop())
-        logger.info("Telegram bot started")
-    logger.info(f"X4G Lite started, UUID={UUID}, protocols={PROTOCOLS}")
+    _bot_running = True
+    _poll_task = asyncio.create_task(_poll_loop())
+    logger.info(f"X4G Lite started, UUID={UUID}, host={HOST}")
 
 @app.on_event("shutdown")
 async def shutdown():
@@ -88,9 +96,6 @@ async def http_proxy(target_url: str, request: Request):
 from relay_vless import websocket_tunnel
 app.add_api_websocket_route("/ws/{uuid}", websocket_tunnel)
 
-from xhttp_siz10 import router as xhttp_router
-app.include_router(xhttp_router)
-
 async def _call(method, **params):
     if _api_client is None:
         return None
@@ -116,19 +121,10 @@ async def _handle_message(msg):
     if chat_id is None or not _is_admin(chat_id):
         return
     if text in ("/start", "/help"):
-        await _send(chat_id, "🤖 X4G Lite\n/config → نمایش لینک‌های اتصال\n/stats → آمار مصرف")
+        await _send(chat_id, "🤖 X4G Lite\n/config → نمایش لینک اتصال\n/stats → آمار مصرف")
     elif text == "/config":
-        lines = []
-        for p in PROTOCOLS:
-            if p == "vless-ws":
-                lines.append(f"VLESS+WS:\nvless://{UUID}@{HOST}:443?encryption=none&security=tls&type=ws&host={HOST}&path=/ws/{UUID}&sni={HOST}&fp=chrome&alpn=http/1.1#X4G")
-            elif p.startswith("xhttp-"):
-                mode = p.replace("xhttp-", "")
-                path = f"/xhttp-siz10/{mode}/{UUID}"
-                lines.append(f"XHTTP ({mode}):\nvless://{UUID}@{HOST}:443?encryption=none&security=tls&type=xhttp&mode={mode}&host={HOST}&path={path}&sni={HOST}&fp=chrome&alpn=h2,http/1.1#X4G")
-        if not lines:
-            lines = ["هیچ پروتکلی فعال نیست."]
-        await _send(chat_id, "\n\n".join(lines))
+        link = f"vless://{UUID}@{HOST}:443?encryption=none&security=tls&type=ws&host={HOST}&path=/ws/{UUID}&sni={HOST}&fp=chrome&alpn=http/1.1#X4G"
+        await _send(chat_id, f"🔗 لینک اتصال:\n<code>{link}</code>")
     elif text == "/stats":
         try:
             async with httpx.AsyncClient() as client:

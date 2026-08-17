@@ -13,20 +13,11 @@
       "required": true
     },
     "TELEGRAM_ADMIN_IDS": {
-      "description": "شناسه عددی ادمین‌های مجاز، با کاما جدا کنید",
+      "description": "شناسه عددی ادمین‌های مجاز (با کاما جدا کنید)",
       "required": true
     },
     "VLESS_UUID": {
-      "description": "UUID یکتا برای اتصالات (اختیاری، در صورت خالی تولید خودکار)",
-      "required": false,
-      "generator": "secret"
-    },
-    "PROTOCOLS": {
-      "description": "پروتکل‌های فعال: vless-ws, xhttp-packet-up, xhttp-stream-up",
-      "value": "vless-ws,xhttp-packet-up"
-    },
-    "SECRET_KEY": {
-      "description": "کلید برای تولید UUID (در صورت نبود VLESS_UUID)",
+      "description": "UUID یکتا برای اتصالات (اختیاری - در صورت خالی خودکار تولید می‌شود)",
       "required": false,
       "generator": "secret"
     }

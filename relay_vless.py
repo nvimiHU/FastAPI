@@ -1,6 +1,7 @@
 import asyncio
 import secrets
 import socket
+import time
 from fastapi import WebSocket, WebSocketDisconnect
 from main import UUID, stats, connections, logger
 
@@ -101,7 +102,6 @@ async def websocket_tunnel(ws: WebSocket, uuid: str):
     if uuid != UUID:
         await ws.close(code=1008, reason="invalid uuid")
         return
-
     await ws.accept()
     ip = _ws_client_ip(ws)
     conn_id = secrets.token_urlsafe(6)
@@ -113,7 +113,6 @@ async def websocket_tunnel(ws: WebSocket, uuid: str):
     }
     logger.info(f"WS connected {conn_id} from {ip}")
     writer = None
-
     try:
         first_msg = await asyncio.wait_for(ws.receive(), timeout=15.0)
         if first_msg["type"] == "websocket.disconnect":
@@ -121,13 +120,11 @@ async def websocket_tunnel(ws: WebSocket, uuid: str):
         first_chunk = first_msg.get("bytes") or (first_msg.get("text") or "").encode()
         if not first_chunk:
             return
-
         command, address, port, payload = await parse_vless_header(first_chunk)
         stats["total_requests"] += 1
         stats["total_bytes"] += len(first_chunk)
         connections[conn_id]["bytes"] += len(first_chunk)
         logger.info(f"WS {conn_id} -> {address}:{port}")
-
         reader, writer = await asyncio.wait_for(
             asyncio.open_connection(address, port),
             timeout=TCP_CONNECT_TIMEOUT
@@ -136,7 +133,6 @@ async def websocket_tunnel(ws: WebSocket, uuid: str):
         if payload:
             writer.write(payload)
             await writer.drain()
-
         done, pending = await asyncio.wait(
             {
                 asyncio.create_task(relay_ws_to_tcp(ws, writer, conn_id)),
@@ -150,7 +146,6 @@ async def websocket_tunnel(ws: WebSocket, uuid: str):
                 await t
             except asyncio.CancelledError:
                 pass
-
     except WebSocketDisconnect:
         pass
     except asyncio.TimeoutError:
