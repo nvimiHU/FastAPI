@@ -108,7 +108,6 @@ async def check_and_use(uid: str, n: int) -> bool:
             return False
         if not is_link_allowed(link):
             return False
-        # در این دمو، فقط مقداردهی ساده
         stats["total_bytes"] += n
         hourly_traffic[now_ir().strftime("%H:00")] = hourly_traffic.get(now_ir().strftime("%H:00"), 0) + n
     return True
@@ -118,11 +117,13 @@ async def relay_ws_to_tcp(ws: WebSocket, writer: asyncio.StreamWriter, conn_id: 
         while True:
             msg = await ws.receive()
             if msg["type"] == "websocket.disconnect":
+                logger.info(f"🔄 relay_ws_to_tcp: WebSocket disconnected for {conn_id}")
                 break
             data = msg.get("bytes") or (msg.get("text") or "").encode()
             if not data:
                 continue
             if not await check_and_use(uid, len(data)):
+                logger.warning(f"🔄 relay_ws_to_tcp: quota exceeded for {conn_id}")
                 await ws.close(code=1008, reason="quota/disabled/unknown")
                 break
             stats["total_requests"] += 1
@@ -131,8 +132,8 @@ async def relay_ws_to_tcp(ws: WebSocket, writer: asyncio.StreamWriter, conn_id: 
             writer.write(data)
             if writer.transport.get_write_buffer_size() > RELAY_BUF:
                 await writer.drain()
-    except (WebSocketDisconnect, Exception):
-        pass
+    except (WebSocketDisconnect, Exception) as e:
+        logger.error(f"🔄 relay_ws_to_tcp error for {conn_id}: {e}")
     finally:
         try:
             writer.write_eof()
@@ -145,8 +146,10 @@ async def relay_tcp_to_ws(ws: WebSocket, reader: asyncio.StreamReader, conn_id: 
         while True:
             data = await reader.read(RELAY_BUF)
             if not data:
+                logger.info(f"🔄 relay_tcp_to_ws: no more data from target for {conn_id}")
                 break
             if not await check_and_use(uid, len(data)):
+                logger.warning(f"🔄 relay_tcp_to_ws: quota exceeded for {conn_id}")
                 await ws.close(code=1008, reason="quota/disabled/unknown")
                 break
             if conn_id in connections:
@@ -154,8 +157,8 @@ async def relay_tcp_to_ws(ws: WebSocket, reader: asyncio.StreamReader, conn_id: 
             payload = (b"\x00\x00" + data) if first else data
             first = False
             await ws.send_bytes(payload)
-    except Exception:
-        pass
+    except Exception as e:
+        logger.error(f"🔄 relay_tcp_to_ws error for {conn_id}: {e}")
 
 async def websocket_tunnel(ws: WebSocket, uuid: str):
     await ws.accept()
@@ -191,21 +194,25 @@ async def websocket_tunnel(ws: WebSocket, uuid: str):
     try:
         first_msg = await asyncio.wait_for(ws.receive(), timeout=15.0)
         if first_msg["type"] == "websocket.disconnect":
+            logger.info(f"WS [{conn_id}] disconnected before sending header")
             return
         first_chunk = first_msg.get("bytes") or (first_msg.get("text") or "").encode()
         if not first_chunk:
+            logger.warning(f"WS [{conn_id}] empty first chunk")
             return
 
+        logger.info(f"WS [{conn_id}] parsing VLESS header (first {len(first_chunk)} bytes)")
         command, address, port, payload = await parse_vless_header(first_chunk)
+        logger.info(f"WS [{conn_id}] parsed → {address}:{port}")
 
         if not await check_and_use(uuid, len(first_chunk)):
+            logger.warning(f"WS [{conn_id}] quota check failed on first chunk")
             await ws.close(code=1008, reason="quota/disabled")
             return
 
         stats["total_requests"] += 1
         if conn_id in connections:
             connections[conn_id]["bytes"] += len(first_chunk)
-        logger.info(f"➡️  [{conn_id}] → {address}:{port}")
 
         reader, writer = await asyncio.wait_for(
             asyncio.open_connection(address, port),
@@ -214,10 +221,12 @@ async def websocket_tunnel(ws: WebSocket, uuid: str):
         sock = writer.transport.get_extra_info('socket')
         if sock:
             sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        logger.info(f"WS [{conn_id}] TCP connected to {address}:{port}")
 
         if payload:
             writer.write(payload)
             await writer.drain()
+            logger.info(f"WS [{conn_id}] wrote payload of {len(payload)} bytes")
 
         done, pending = await asyncio.wait(
             {
@@ -234,16 +243,18 @@ async def websocket_tunnel(ws: WebSocket, uuid: str):
                 pass
 
         asyncio.create_task(save_state())
+        logger.info(f"WS [{conn_id}] relay tasks finished")
 
     except WebSocketDisconnect:
-        pass
+        logger.info(f"WS [{conn_id}] WebSocket disconnected")
     except asyncio.TimeoutError:
         stats["total_errors"] += 1
         error_logs.append({"error": "connection timeout", "time": datetime.now().isoformat()})
+        logger.error(f"WS [{conn_id}] timeout")
     except Exception as exc:
         stats["total_errors"] += 1
         error_logs.append({"error": str(exc), "time": datetime.now().isoformat()})
-        logger.error(f"WS error [{conn_id}]: {exc}")
+        logger.error(f"WS [{conn_id}] error: {exc}")
     finally:
         if writer:
             try:
@@ -390,7 +401,7 @@ async def _poll_loop():
             logger.warning(f"Poll loop error: {e}")
             await asyncio.sleep(3)
 
-@app.get("/xhttp")  # این مسیر فقط برای نمایش لینک XHTTP (اختیاری) باقی می‌ماند، اما می‌توان حذف کرد.
+@app.get("/xhttp")  # این مسیر فقط برای نمایش لینک (اختیاری) باقی می‌ماند
 async def xhttp_link():
     link = f"vless://{UUID}@{HOST}:443?encryption=none&security=tls&type=ws&host={HOST}&path=/ws/{UUID}&sni={HOST}&fp=chrome#X4G-WS"
     return {"link": link}
