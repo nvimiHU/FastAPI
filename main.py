@@ -12,7 +12,7 @@ import uvicorn
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("X4G")
 
-app = FastAPI(title="X4G Lite - XHTTP Only", docs_url=None, redoc_url=None)
+app = FastAPI(title="X4G Lite", docs_url=None, redoc_url=None)
 
 PORT = int(os.environ.get("PORT", 8000))
 UUID = os.environ.get("VLESS_UUID") or secrets.token_urlsafe(16)
@@ -46,7 +46,7 @@ async def startup():
     _api_client = httpx.AsyncClient(timeout=40.0)
     _bot_running = True
     _poll_task = asyncio.create_task(_poll_loop())
-    logger.info(f"X4G Lite (XHTTP Only) started, UUID={UUID}, host={HOST}")
+    logger.info(f"X4G Lite started, UUID={UUID}, host={HOST}")
 
 @app.on_event("shutdown")
 async def shutdown():
@@ -255,7 +255,6 @@ async def websocket_tunnel(ws: WebSocket, uuid: str):
 from xhttp_siz10 import router as xhttp_router
 app.include_router(xhttp_router)
 
-# ربات تلگرام (دقیقاً مثل فایل اصلی)
 async def _call(method, **params):
     if _api_client is None:
         return None
@@ -283,7 +282,7 @@ async def _handle_message(msg):
     if text in ("/start", "/help"):
         await _send(chat_id, "🤖 X4G Lite\n/config → نمایش لینک اتصال\n/stats → آمار مصرف")
     elif text == "/config":
-        link = f"XHTTP://{UUID}@{HOST}:443?type=xhttp-siz10&mode=stream-up&host={HOST}&fp=chrome#X4G-XHTTP"
+        link = f"vless://{UUID}@{HOST}:443?encryption=none&security=tls&type=xhttp&host={HOST}&path=/xhttp-siz10/{UUID}&mode=auto&sni={HOST}&fp=chrome&alpn=h2%2Chttp%2F1.1#X4G-Mahdi"
         await _send(chat_id, f"🔗 لینک اتصال:\n<code>{link}</code>")
     elif text == "/stats":
         try:
@@ -299,7 +298,7 @@ async def _handle_message(msg):
         except Exception:
             await _send(chat_id, "خطا در دریافت آمار.")
     else:
-        await _send(chat_id, "دستور نامعتبر.")
+        await _send(chat_id, "دستور نامعتبر. از /config یا /stats استفاده کنید.")
 
 async def _poll_loop():
     offset = 0
