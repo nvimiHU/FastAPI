@@ -17,9 +17,19 @@
       "required": true
     },
     "VLESS_UUID": {
-      "description": "UUID یکتا برای اتصالات (اختیاری - در صورت خالی خودکار تولید می‌شود)",
+      "description": "UUID یکتا برای اتصالات WebSocket (اختیاری - در صورت خالی خودکار تولید می‌شود)",
       "required": false,
       "generator": "secret"
+    },
+    "XHTTP_TARGET_HOST": {
+      "description": "آدرس مقصد برای ترابرد XHTTP (پیش‌فرض: localhost)",
+      "required": false,
+      "value": "localhost"
+    },
+    "XHTTP_TARGET_PORT": {
+      "description": "پورت مقصد برای ترابرد XHTTP (پیش‌فرض: 443)",
+      "required": false,
+      "value": "443"
     }
   }
 }

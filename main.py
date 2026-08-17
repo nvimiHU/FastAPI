@@ -96,6 +96,9 @@ async def http_proxy(target_url: str, request: Request):
 from relay_vless import websocket_tunnel
 app.add_api_websocket_route("/ws/{uuid}", websocket_tunnel)
 
+from xhttp_siz10 import router as xhttp_router
+app.include_router(xhttp_router)
+
 async def _call(method, **params):
     if _api_client is None:
         return None
