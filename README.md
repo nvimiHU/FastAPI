@@ -6,7 +6,7 @@
 
 ## ⚠️ Important Disclaimer
 
-This repository **does not provide**, **does not endorse**, and **has no relation to** any VPN services, censorship circumvention tools, or real-world networking infrastructure.
+This repository **does not provide**, **does not endorse**, and **has no relation to** any VPN services, censorship circumvention tools, or real‑world networking infrastructure.
 
 All implementations are **minimal, non‑functional stubs** designed solely to illustrate programming concepts such as:
 - Handling WebSocket connections in FastAPI
@@ -36,6 +36,7 @@ It is **not intended for production use** and should **never be used to bypass n
 ## 📖 How It Works (At a Glance)
 
 - A single **static UUID** (set via `VLESS_UUID` or auto‑generated) is used for demo endpoints.
+- The entire code is contained in a single file (`main.py`) for easy experimentation.
 - Two abstract transports are supported:
   - **WebSocket** (`/ws/{uuid}`) — for connection‑oriented streaming
   - **XHTTP** (`/xhttp-siz10/{mode}/{uuid}/{session_id}`) — with two modes:
@@ -84,13 +85,14 @@ The included `railway.json` enforces required environment variables (`TELEGRAM_B
 - `XHTTP_TARGET_HOST` and `XHTTP_TARGET_PORT` are optional and default to `localhost:443`.
 - The public domain (`RAILWAY_PUBLIC_DOMAIN`) is automatically set by Railway.
 - The application binds to the port provided by Railway (`$PORT`).
+- The `railway.json` includes health check and restart policies for robust deployment.
 
 ---
 
 ## 📚 Educational Value
 
 By studying this code, you can learn:
-- How to structure a FastAPI project with separate routers for WebSocket and XHTTP logic
+- How to structure a FastAPI project (in a single file for simplicity) with WebSocket and XHTTP routing
 - How to implement adaptive flow control (AIMD) for streaming transports
 - How to manage packet‑based sequencing and session state
 - How to write a long‑polling Telegram bot
