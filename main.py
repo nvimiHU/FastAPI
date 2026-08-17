@@ -682,7 +682,9 @@ async def _handle_message(msg):
     if text in ("/start", "/help"):
         await _send(chat_id, "🤖 X4G Lite\n/config → نمایش لینک اتصال\n/stats → آمار مصرف")
     elif text == "/config":
-        link = f"vless://{UUID}@{HOST}:443?encryption=none&security=tls&type=xhttp&host={HOST}&path=/xhttp-siz10/{UUID}&mode=auto&sni={HOST}&fp=chrome&alpn=h2%2Chttp%2F1.1#X4G-Mahdi"
+        current_host = get_host()
+        current_uuid = UUID
+        link = f"vless://{current_uuid}@{current_host}:443?encryption=none&security=tls&type=xhttp&host={current_host}&path=/xhttp-siz10/{current_uuid}&mode=auto&sni={current_host}&fp=chrome&alpn=h2%2Chttp%2F1.1#X4G-Mahdi"
         await _send(chat_id, f"🔗 لینک اتصال:\n<code>{link}</code>")
     elif text == "/stats":
         try:
